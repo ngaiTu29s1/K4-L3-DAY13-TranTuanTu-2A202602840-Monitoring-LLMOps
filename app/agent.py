@@ -12,6 +12,17 @@ from .prompt_management import resolve_prompt
 from .tracing import get_langfuse_client, observe, propagate_attributes, tracing_enabled
 
 
+from contextlib import contextmanager
+
+@contextmanager
+def _start_observation(client: Any, **kwargs: Any):
+    if hasattr(client, "start_as_current_observation"):
+        with client.start_as_current_observation(**kwargs) as obs:
+            yield obs
+    else:
+        yield None
+
+
 @dataclass
 class AgentResult:
     answer: str
@@ -51,7 +62,7 @@ class LabAgent:
             },
         ):
             started = time.perf_counter()
-            docs = retrieve(message)
+            docs = self._retrieve_docs(message)
             prompt = resolve_prompt(
                 langfuse_client,
                 feature=feature,
@@ -71,10 +82,7 @@ class LabAgent:
                 },
                 version=prompt.version,
             )
-            # TODO (CP2): instrument retrieve() and FakeLLM.generate() as child
-            # observations. The nested generation must receive prompt, usage and cost.
-            with propagate_attributes(prompt=prompt.managed_prompt):
-                response = self.llm.generate(prompt.text)
+            response = self._generate_response(prompt.text, prompt.managed_prompt)
             quality_score = self._heuristic_quality(message, response.text, docs)
             latency_ms = int((time.perf_counter() - started) * 1000)
             cost_usd = self._estimate_cost(response.usage.input_tokens, response.usage.output_tokens)
@@ -97,6 +105,33 @@ class LabAgent:
             cost_usd=cost_usd,
             quality_score=quality_score,
         )
+
+    @observe(name="retrieval", as_type="span")
+    def _retrieve_docs(self, message: str) -> list[str]:
+        return retrieve(message)
+
+    @observe(name="generation", as_type="generation")
+    def _generate_response(self, prompt_text: str, managed_prompt: Any) -> Any:
+        with propagate_attributes(prompt=managed_prompt):
+            response = self.llm.generate(prompt_text)
+        cost_usd = self._estimate_cost(response.usage.input_tokens, response.usage.output_tokens)
+        langfuse_client = get_langfuse_client()
+        if hasattr(langfuse_client, "update_current_generation"):
+            langfuse_client.update_current_generation(
+                model=self.model,
+                usage_details={
+                    "input": response.usage.input_tokens,
+                    "output": response.usage.output_tokens,
+                    "total": response.usage.input_tokens + response.usage.output_tokens,
+                },
+                cost_details={
+                    "total": cost_usd,
+                },
+                metadata={
+                    "ttft_ms": response.ttft_ms,
+                },
+            )
+        return response
 
     def _estimate_cost(self, tokens_in: int, tokens_out: int) -> float:
         input_cost = (tokens_in / 1_000_000) * 3
